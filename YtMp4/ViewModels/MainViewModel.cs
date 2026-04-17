@@ -61,8 +61,9 @@ public partial class MainViewModel : ObservableObject
 
             IsIndeterminate = false;
             ProgressValue = update.Percentage;
-            SpeedText = update.Speed;
-            StatusText = update.Percentage >= 100 ? "Finishing..." : "Downloading...";
+            bool finishing = update.Percentage >= 100;
+            SpeedText = finishing ? string.Empty : update.Speed;
+            StatusText = finishing ? "Finishing..." : "Downloading...";
         });
 
         try
