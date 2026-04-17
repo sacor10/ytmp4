@@ -1,0 +1,146 @@
+<Window x:Class="YtMp4.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:YtMp4.ViewModels"
+        Title="YtMp4 Downloader" Height="240" Width="620"
+        ResizeMode="CanMinimize" WindowStartupLocation="CenterScreen">
+
+    <Window.DataContext>
+        <vm:MainViewModel />
+    </Window.DataContext>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- URL row -->
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <Grid Grid.Column="0">
+                <TextBox Text="{Binding Url, UpdateSourceTrigger=PropertyChanged}"
+                         FontSize="14" Padding="6,4"
+                         VerticalContentAlignment="Center"
+                         IsEnabled="{Binding IsDownloading, Converter={StaticResource InvertBool}}"/>
+                <TextBlock Text="Paste YouTube URL here..."
+                           FontSize="14" Padding="8,4" VerticalAlignment="Center"
+                           Foreground="#AAA" IsHitTestVisible="False">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding Url}" Value="">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+            </Grid>
+
+            <Button Grid.Column="2"
+                    Content="Download"
+                    FontSize="14" Padding="16,4"
+                    Command="{Binding DownloadCommand}"
+                    Visibility="{Binding IsDownloading, Converter={StaticResource BoolToHidden}}"/>
+
+            <Button Grid.Column="2"
+                    Content="Cancel"
+                    FontSize="14" Padding="16,4"
+                    Command="{Binding CancelCommand}"
+                    Visibility="{Binding IsDownloading, Converter={StaticResource BoolToVisible}}"/>
+        </Grid>
+
+        <!-- Folder row -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="8"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Column="0" Text="Save to:" FontSize="12" VerticalAlignment="Center" Foreground="#555"/>
+            <TextBox Grid.Column="2"
+                     Text="{Binding OutputFolder, UpdateSourceTrigger=PropertyChanged}"
+                     FontSize="12" Padding="6,3"
+                     VerticalContentAlignment="Center"
+                     IsEnabled="{Binding IsDownloading, Converter={StaticResource InvertBool}}"/>
+            <Button Grid.Column="4"
+                    Content="Browse..."
+                    FontSize="12" Padding="12,3"
+                    Command="{Binding BrowseFolderCommand}"
+                    IsEnabled="{Binding IsDownloading, Converter={StaticResource InvertBool}}"/>
+        </Grid>
+
+        <!-- Progress bar -->
+        <ProgressBar Grid.Row="4"
+                     Value="{Binding ProgressValue}"
+                     Maximum="100" Height="18"
+                     IsIndeterminate="{Binding IsIndeterminate}"/>
+
+        <!-- Status row -->
+        <Grid Grid.Row="6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- While downloading / before first download: plain status -->
+            <TextBlock Grid.Column="0" FontSize="12" VerticalAlignment="Center" Foreground="#555"
+                       Text="{Binding StatusText}">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Visibility" Value="Visible"/>
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding HasCompletedDownload}" Value="True">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+
+            <!-- After success: "Done! Saved to <link>" with the folder path as a hyperlink -->
+            <TextBlock Grid.Column="0" FontSize="12" VerticalAlignment="Center" Foreground="#555">
+                <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Visibility" Value="Collapsed"/>
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding HasCompletedDownload}" Value="True">
+                                <Setter Property="Visibility" Value="Visible"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+                <Run Text="Done! Saved to "/>
+                <Hyperlink Command="{Binding OpenFolderCommand}">
+                    <Run Text="{Binding OutputFolder, Mode=OneWay}"/>
+                </Hyperlink>
+            </TextBlock>
+
+            <TextBlock Grid.Column="1" Text="{Binding SpeedText}" FontSize="12" VerticalAlignment="Center" Foreground="#555"/>
+
+            <!-- Play button appears only when download complete -->
+            <Button Grid.Column="3"
+                    Content="▶ Play"
+                    FontSize="12" Padding="10,3"
+                    Command="{Binding PlayVideoCommand}"
+                    Visibility="{Binding HasCompletedDownload, Converter={StaticResource BoolToVisible}}"/>
+        </Grid>
+    </Grid>
+</Window>
