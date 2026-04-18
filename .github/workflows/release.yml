@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Get version from tag
+        id: ver
+        shell: bash
+        run: echo "value=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download yt-dlp
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path YtMp4/tools | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -OutFile "YtMp4/tools/yt-dlp.exe"
+
+      - name: Download FFmpeg (shared build with DLLs)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip" `
+            -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-tmp
+          $bin = Get-ChildItem ffmpeg-tmp -Recurse -Directory -Filter bin | Select-Object -First 1
+          Copy-Item "$($bin.FullName)/ffmpeg.exe" "YtMp4/tools/ffmpeg.exe"
+          Copy-Item "$($bin.FullName)/*.dll"      "YtMp4/tools/"
+
+      - name: Publish (self-contained, single-file, win-x64)
+        shell: pwsh
+        run: |
+          dotnet publish YtMp4/YtMp4.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -o dist/app
+
+      - name: Assemble package
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.value }}"
+          Copy-Item -Path "YtMp4/tools" -Destination "dist/app/tools" -Recurse
+          @"
+          YtMp4 v$ver - YouTube to MP4 Downloader
+          ==========================================
+          1. Extract this zip to any folder
+          2. Run YtMp4.exe
+          3. Paste a YouTube URL, pick a save folder, click Download
+
+          No installation needed. Windows 10/11 x64 only.
+          "@ | Out-File -FilePath "dist/app/README.txt" -Encoding utf8
+          Compress-Archive -Path "dist/app/*" -DestinationPath "dist/ytmp4.zip"
+          $mb = [math]::Round((Get-Item "dist/ytmp4.zip").Length / 1MB, 0)
+          Write-Host "Package: ytmp4.zip ($mb MB)"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ytmp4.zip
+          generate_release_notes: true
