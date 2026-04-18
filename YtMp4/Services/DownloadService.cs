@@ -40,7 +40,7 @@ public class DownloadService
         string format = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b";
         // Boost audio during the merge step — re-encode audio only (video stays copied),
         // so we avoid a second full-file ffmpeg pass after download.
-        string mergerArgs = "-filter:a volume=4.0 -c:a aac -b:a 192k";
+        string mergerArgs = "-filter:a volume=2.0 -c:a aac -b:a 192k";
         string args = $"-f \"{format}\" --merge-output-format mp4 --ffmpeg-location \"{FfmpegDir}\" " +
                       $"--concurrent-fragments 16 --http-chunk-size 10M " +
                       $"--paths \"temp:{tempDir}\" --paths \"home:{outputDir}\" " +
