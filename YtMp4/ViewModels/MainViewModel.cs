@@ -30,7 +30,13 @@ public partial class MainViewModel : ObservableObject
     [NotifyPropertyChangedFor(nameof(HasCompletedDownload))]
     private string? _lastDownloadedFile;
 
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(OpenLogCommand))]
+    [NotifyPropertyChangedFor(nameof(HasLogFile))]
+    private string? _lastLogFilePath;
+
     public bool HasCompletedDownload => !string.IsNullOrEmpty(LastDownloadedFile);
+    public bool HasLogFile => !string.IsNullOrEmpty(LastLogFilePath);
 
     [RelayCommand(CanExecute = nameof(CanDownload))]
     private async Task DownloadAsync()
@@ -89,10 +95,20 @@ public partial class MainViewModel : ObservableObject
         {
             IsDownloading = false;
             SpeedText = string.Empty;
+            LastLogFilePath = _service.LastLogFilePath;
             _cts.Dispose();
             _cts = null;
         }
     }
+
+    [RelayCommand(CanExecute = nameof(CanOpenLog))]
+    private void OpenLog()
+    {
+        if (string.IsNullOrEmpty(LastLogFilePath) || !File.Exists(LastLogFilePath)) return;
+        Process.Start(new ProcessStartInfo(LastLogFilePath) { UseShellExecute = true });
+    }
+
+    private bool CanOpenLog() => !string.IsNullOrEmpty(LastLogFilePath) && File.Exists(LastLogFilePath);
 
     private bool CanDownload() => !string.IsNullOrWhiteSpace(Url);
 

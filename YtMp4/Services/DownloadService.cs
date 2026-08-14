@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace YtMp4.Services;
@@ -15,10 +17,17 @@ public class DownloadService
     // percent | downloaded_bytes | total_bytes | status
     private static readonly Regex ProgressRegex = new(@"^(\d+\.?\d*)%\|([^|]*)\|([^|]*)\|(.*)$");
 
+    private static bool _ytDlpUpdateChecked;
+
     private string ToolsDir => Path.Combine(AppContext.BaseDirectory, "tools");
 
     private string YtDlpPath => Path.Combine(ToolsDir, "yt-dlp.exe");
     private string FfmpegDir => ToolsDir;
+
+    private string LogsDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YtMp4", "logs");
+
+    public string? LastLogFilePath { get; private set; }
 
     public async Task<string?> DownloadAsync(string url, string outputDir, IProgress<DownloadProgress> progress, CancellationToken cancellationToken)
     {
@@ -28,6 +37,8 @@ public class DownloadService
             throw new FileNotFoundException($"ffmpeg.exe not found. Place it in: {ToolsDir}");
         if (string.IsNullOrWhiteSpace(outputDir) || !Directory.Exists(outputDir))
             throw new DirectoryNotFoundException($"Output folder not found: {outputDir}");
+
+        await EnsureYtDlpUpdatedAsync(progress, cancellationToken);
 
         string tempDir = Path.Combine(outputDir, ".ytmp4-tmp-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempDir);
@@ -59,9 +70,17 @@ public class DownloadService
         var tracker = new ProgressTracker();
         string? finalFilePath = null;
 
+        var log = new StringBuilder();
+        var logLock = new object();
+        log.AppendLine($"YtMp4 download log — {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        log.AppendLine($"URL: {url}");
+        log.AppendLine($"Command: {YtDlpPath} {args}");
+        log.AppendLine();
+
         process.OutputDataReceived += (_, e) =>
         {
             if (e.Data is null) return;
+            lock (logLock) log.AppendLine("[out] " + e.Data);
             if (e.Data.StartsWith("FILEPATH:"))
             {
                 finalFilePath = e.Data.Substring("FILEPATH:".Length).Trim();
@@ -83,6 +102,7 @@ public class DownloadService
         process.ErrorDataReceived += (_, e) =>
         {
             if (e.Data is null) return;
+            lock (logLock) log.AppendLine("[err] " + e.Data);
             if (e.Data.Contains("[Merger]"))
                 progress.Report(new DownloadProgress(100, "", "Merging streams...", true));
             lock (stderrTail)
@@ -121,6 +141,83 @@ public class DownloadService
         finally
         {
             TryDeleteDirectory(tempDir);
+            lock (logLock)
+            {
+                log.AppendLine();
+                log.AppendLine($"Exit code: {(process.HasExited ? process.ExitCode : "n/a")}");
+                LastLogFilePath = WriteLogFile(log.ToString());
+            }
+        }
+    }
+
+    private async Task EnsureYtDlpUpdatedAsync(IProgress<DownloadProgress> progress, CancellationToken cancellationToken)
+    {
+        if (_ytDlpUpdateChecked) return;
+        _ytDlpUpdateChecked = true;
+
+        progress.Report(new DownloadProgress(0, "", "Checking for updates...", false) { IsInfoOnly = true });
+
+        try
+        {
+            var psi = new ProcessStartInfo(YtDlpPath, "-U")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = new Process { StartInfo = psi };
+            process.Start();
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(15));
+            try
+            {
+                await process.WaitForExitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Update check timed out (not a user cancel) — kill it and proceed with the existing binary.
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Best-effort: if the update check fails (e.g. offline), continue with whatever yt-dlp.exe is present.
+        }
+    }
+
+    private string? WriteLogFile(string content)
+    {
+        try
+        {
+            Directory.CreateDirectory(LogsDir);
+            string path = Path.Combine(LogsDir, $"ytmp4-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            File.WriteAllText(path, content);
+            PruneOldLogs();
+            return path;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void PruneOldLogs()
+    {
+        try
+        {
+            var oldLogs = new DirectoryInfo(LogsDir).GetFiles("ytmp4-*.log")
+                .OrderByDescending(f => f.CreationTimeUtc)
+                .Skip(20);
+            foreach (var file in oldLogs)
+                file.Delete();
+        }
+        catch
+        {
+            // best-effort cleanup
         }
     }
 

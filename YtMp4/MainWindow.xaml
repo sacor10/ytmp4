@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="clr-namespace:YtMp4.ViewModels"
         Title="YtMp4 Downloader" Height="240" Width="620"
+        Icon="Resources/app.ico"
         ResizeMode="CanMinimize" WindowStartupLocation="CenterScreen">
 
     <Window.DataContext>
@@ -96,6 +97,7 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="12"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
@@ -135,8 +137,16 @@
 
             <TextBlock Grid.Column="1" Text="{Binding SpeedText}" FontSize="12" VerticalAlignment="Center" Foreground="#555"/>
 
+            <!-- View Log link appears whenever a log file exists from the last run -->
+            <TextBlock Grid.Column="2" FontSize="12" VerticalAlignment="Center" Margin="12,0,0,0"
+                       Visibility="{Binding HasLogFile, Converter={StaticResource BoolToVisible}}">
+                <Hyperlink Command="{Binding OpenLogCommand}">
+                    <Run Text="View Log"/>
+                </Hyperlink>
+            </TextBlock>
+
             <!-- Play button appears only when download complete -->
-            <Button Grid.Column="3"
+            <Button Grid.Column="4"
                     Content="▶ Play"
                     FontSize="12" Padding="10,3"
                     Command="{Binding PlayVideoCommand}"
