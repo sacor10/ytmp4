@@ -23,6 +23,7 @@ public class DownloadService
 
     private string YtDlpPath => Path.Combine(ToolsDir, "yt-dlp.exe");
     private string FfmpegDir => ToolsDir;
+    private string DenoPath => Path.Combine(ToolsDir, "deno.exe");
 
     private string LogsDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YtMp4", "logs");
@@ -49,7 +50,11 @@ public class DownloadService
         string outputTemplate = "%(title)s.%(ext)s";
 
         string format = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b";
+        // YouTube requires running a JS runtime to decrypt signature URLs; without one, some
+        // formats resolve to stale/invalid URLs that fail mid-download with HTTP 403.
+        string jsRuntimeArg = File.Exists(DenoPath) ? $"--js-runtimes \"deno:{DenoPath}\" " : "";
         string args = $"-f \"{format}\" --merge-output-format mp4 --ffmpeg-location \"{FfmpegDir}\" " +
+                      jsRuntimeArg +
                       $"--concurrent-fragments 16 --http-chunk-size 10M " +
                       $"--paths \"temp:{tempDir}\" --paths \"home:{outputDir}\" " +
                       // --print implies --quiet, suppressing progress output. --progress forces it back on.
