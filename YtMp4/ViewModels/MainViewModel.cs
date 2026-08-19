@@ -19,6 +19,13 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _outputFolder =
         Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
 
+    /// <summary>
+    /// Constrains the download to H.264 + AAC (and converts if YouTube has no H.264 ladder),
+    /// which is all X.com accepts. Uncheck it to get the best available stream instead — that
+    /// can be AV1 or VP9, and can go above 1080p.
+    /// </summary>
+    [ObservableProperty] private bool _isXCompatible = true;
+
     [ObservableProperty] private double _progressValue;
     [ObservableProperty] private string _statusText = "Ready";
     [ObservableProperty] private string _speedText = string.Empty;
@@ -58,6 +65,15 @@ public partial class MainViewModel : ObservableObject
                 return;
             }
 
+            if (update.IsTranscoding)
+            {
+                IsIndeterminate = false;
+                ProgressValue = update.Percentage;
+                SpeedText = string.Empty;
+                StatusText = update.Status;
+                return;
+            }
+
             if (update.IsInfoOnly)
             {
                 IsIndeterminate = true;
@@ -74,7 +90,7 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            var path = await _service.DownloadAsync(Url, OutputFolder, progress, _cts.Token);
+            var path = await _service.DownloadAsync(Url, OutputFolder, IsXCompatible, progress, _cts.Token);
             IsIndeterminate = false;
             ProgressValue = 100;
             LastDownloadedFile = path;

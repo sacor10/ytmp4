@@ -10,12 +10,18 @@ namespace YtMp4.Services;
 public record DownloadProgress(double Percentage, string Speed, string Status, bool IsMerging)
 {
     public bool IsInfoOnly { get; init; }
+    public bool IsTranscoding { get; init; }
 }
 
 public class DownloadService
 {
     // percent | downloaded_bytes | total_bytes | status
     private static readonly Regex ProgressRegex = new(@"^(\d+\.?\d*)%\|([^|]*)\|([^|]*)\|(.*)$");
+
+    // X.com plays H.264 video + AAC audio only, capped at 1920x1200 and 60fps.
+    private const int XMaxWidth = 1920;
+    private const int XMaxHeight = 1200;
+    private const double XMaxFps = 60;
 
     private static bool _ytDlpUpdateChecked;
 
@@ -30,7 +36,7 @@ public class DownloadService
 
     public string? LastLogFilePath { get; private set; }
 
-    public async Task<string?> DownloadAsync(string url, string outputDir, IProgress<DownloadProgress> progress, CancellationToken cancellationToken)
+    public async Task<string?> DownloadAsync(string url, string outputDir, bool xCompatible, IProgress<DownloadProgress> progress, CancellationToken cancellationToken)
     {
         if (!File.Exists(YtDlpPath))
             throw new FileNotFoundException($"yt-dlp.exe not found. Place it in: {ToolsDir}");
@@ -49,7 +55,22 @@ public class DownloadService
         // instead of our temp subfolder.
         string outputTemplate = "%(title)s.%(ext)s";
 
-        string format = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b";
+        // "mp4" is not the same thing as H.264 on YouTube — av01 (AV1) is served in mp4
+        // containers too, and yt-dlp's default codec preference is av01 > vp9 > h264. So an
+        // ext-only selector hands back an AV1-in-mp4 file, which X.com rejects with
+        // "Incompatible video codecs" (YouTube re-encodes on upload, so it never complains).
+        // YouTube's avc1 ladder stops at 1080p, which is also X's practical ceiling.
+        string format = xCompatible
+            ? "bv*[vcodec^=avc1][height<=1080][fps<=60]+ba[acodec^=mp4a]/" +
+              "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/" +
+              "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"
+            : "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba[ext=m4a]/bv*+ba/b";
+        // Move the moov atom to the front and report the codecs we actually got, so we can
+        // transcode afterwards for the few videos with no H.264 ladder at all.
+        string xCompatArgs = xCompatible
+            ? "--postprocessor-args \"Merger:-movflags +faststart\" " +
+              "--print \"after_move:META:%(vcodec)s|%(acodec)s|%(width)s|%(height)s|%(fps)s|%(duration)s\" "
+            : "";
         // YouTube requires running a JS runtime to decrypt signature URLs; without one, some
         // formats resolve to stale/invalid URLs that fail mid-download with HTTP 403.
         string jsRuntimeArg = File.Exists(DenoPath) ? $"--js-runtimes \"deno:{DenoPath}\" " : "";
@@ -60,6 +81,7 @@ public class DownloadService
                       // --print implies --quiet, suppressing progress output. --progress forces it back on.
                       $"--newline --progress --progress-template \"download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.status)s\" " +
                       $"--print \"after_move:FILEPATH:%(filepath)s\" " +
+                      xCompatArgs +
                       $"--restrict-filenames -o \"{outputTemplate}\" \"{url}\"";
 
         var psi = new ProcessStartInfo(YtDlpPath, args)
@@ -74,6 +96,7 @@ public class DownloadService
         var stderrTail = new Queue<string>();
         var tracker = new ProgressTracker();
         string? finalFilePath = null;
+        MediaMeta? meta = null;
 
         var log = new StringBuilder();
         var logLock = new object();
@@ -89,6 +112,11 @@ public class DownloadService
             if (e.Data.StartsWith("FILEPATH:"))
             {
                 finalFilePath = e.Data.Substring("FILEPATH:".Length).Trim();
+                return;
+            }
+            if (e.Data.StartsWith("META:"))
+            {
+                meta = MediaMeta.Parse(e.Data.Substring("META:".Length));
                 return;
             }
             var parsed = tracker.Update(e.Data);
@@ -141,6 +169,9 @@ public class DownloadService
                 throw new InvalidOperationException($"yt-dlp exited with code {process.ExitCode}. {tail}");
             }
 
+            if (xCompatible && finalFilePath is not null && File.Exists(finalFilePath))
+                finalFilePath = await MakeXCompatibleAsync(finalFilePath, meta, progress, log, logLock, cancellationToken);
+
             return finalFilePath;
         }
         finally
@@ -153,6 +184,149 @@ public class DownloadService
                 LastLogFilePath = WriteLogFile(log.ToString());
             }
         }
+    }
+
+    /// <summary>
+    /// Makes the finished file something X.com will accept. Streams that already qualify are
+    /// stream-copied, so this is a cheap remux in the normal case; it only really re-encodes
+    /// when YouTube had no H.264 ladder for the video (some Shorts and newer uploads are
+    /// AV1/VP9 only) or the source is above X's frame size / rate caps.
+    /// </summary>
+    private async Task<string> MakeXCompatibleAsync(
+        string path,
+        MediaMeta? meta,
+        IProgress<DownloadProgress> progress,
+        StringBuilder log,
+        object logLock,
+        CancellationToken cancellationToken)
+    {
+        if (meta is null)
+        {
+            lock (logLock) log.AppendLine("[x-compat] yt-dlp reported no stream metadata; leaving the file as-is");
+            return path;
+        }
+
+        if (!meta.HasKnownCodecs)
+        {
+            lock (logLock) log.AppendLine($"[x-compat] codecs unknown ({meta}); leaving the file as-is");
+            return path;
+        }
+
+        bool videoOk = meta.IsXVideoCompatible;
+        bool audioOk = meta.IsXAudioCompatible;
+        if (videoOk && audioOk)
+        {
+            lock (logLock) log.AppendLine($"[x-compat] {meta} is already X-compatible; no conversion needed");
+            return path;
+        }
+
+        string tempPath = Path.Combine(
+            Path.GetDirectoryName(path)!,
+            Path.GetFileNameWithoutExtension(path) + ".xtmp-" + Guid.NewGuid().ToString("N")[..8] + ".mp4");
+
+        var ffArgs = new StringBuilder();
+        ffArgs.Append($"-hide_banner -nostdin -y -i \"{path}\" ");
+        if (videoOk)
+        {
+            ffArgs.Append("-c:v copy ");
+        }
+        else
+        {
+            // No explicit -level: x264 picks a conformant one for the (capped) frame size.
+            ffArgs.Append("-c:v libx264 -profile:v high -pix_fmt yuv420p -preset veryfast -crf 20 ");
+            string fpsCap = meta.Fps > XMaxFps ? $",fps={XMaxFps}" : "";
+            ffArgs.Append($"-vf \"scale='min({XMaxWidth},iw)':'min({XMaxHeight},ih)'" +
+                          $":force_original_aspect_ratio=decrease:force_divisible_by=2{fpsCap}\" ");
+        }
+        ffArgs.Append(audioOk ? "-c:a copy " : "-c:a aac -b:a 192k -ac 2 ");
+        ffArgs.Append($"-movflags +faststart -progress pipe:1 -nostats \"{tempPath}\"");
+
+        string ffmpegPath = Path.Combine(FfmpegDir, "ffmpeg.exe");
+        lock (logLock)
+        {
+            log.AppendLine($"[x-compat] {meta} needs conversion (video ok: {videoOk}, audio ok: {audioOk})");
+            log.AppendLine($"[x-compat] command: {ffmpegPath} {ffArgs}");
+        }
+
+        const string statusText = "Converting for X.com...";
+        double durationSec = meta.Duration;
+        progress.Report(durationSec > 0
+            ? new DownloadProgress(0, "", statusText, false) { IsTranscoding = true }
+            : new DownloadProgress(0, "", statusText, false) { IsInfoOnly = true });
+
+        var psi = new ProcessStartInfo(ffmpegPath, ffArgs.ToString())
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var ffmpeg = new Process { StartInfo = psi };
+        var stderrTail = new Queue<string>();
+
+        ffmpeg.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is null || durationSec <= 0) return;
+            // -progress writes key=value lines; out_time_us is the position in the output.
+            if (!e.Data.StartsWith("out_time_us=")) return;
+            if (!long.TryParse(e.Data.Substring("out_time_us=".Length), NumberStyles.Any,
+                    CultureInfo.InvariantCulture, out long microseconds) || microseconds <= 0)
+                return;
+            double pct = Math.Clamp(microseconds / 1_000_000.0 / durationSec * 100.0, 0, 100);
+            progress.Report(new DownloadProgress(pct, "", statusText, false) { IsTranscoding = true });
+        };
+
+        ffmpeg.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is null) return;
+            lock (logLock) log.AppendLine("[ffmpeg] " + e.Data);
+            lock (stderrTail)
+            {
+                stderrTail.Enqueue(e.Data);
+                while (stderrTail.Count > 20) stderrTail.Dequeue();
+            }
+        };
+
+        ffmpeg.Start();
+        ffmpeg.BeginOutputReadLine();
+        ffmpeg.BeginErrorReadLine();
+
+        try
+        {
+            await ffmpeg.WaitForExitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!ffmpeg.HasExited)
+                ffmpeg.Kill(entireProcessTree: true);
+            TryDeleteFile(tempPath);
+            throw;
+        }
+
+        if (ffmpeg.ExitCode != 0)
+        {
+            TryDeleteFile(tempPath);
+            string tail;
+            lock (stderrTail) tail = string.Join(" | ", stderrTail);
+            throw new InvalidOperationException(
+                $"X.com conversion failed (ffmpeg exited with code {ffmpeg.ExitCode}). {tail}");
+        }
+
+        // The download itself succeeded — if the swap fails, keep the original file.
+        try
+        {
+            File.Move(tempPath, path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            lock (logLock) log.AppendLine($"[x-compat] could not replace the original file: {ex.Message}");
+            TryDeleteFile(tempPath);
+            return path;
+        }
+
+        lock (logLock) log.AppendLine("[x-compat] conversion complete");
+        return path;
     }
 
     private async Task EnsureYtDlpUpdatedAsync(IProgress<DownloadProgress> progress, CancellationToken cancellationToken)
@@ -226,6 +400,19 @@ public class DownloadService
         }
     }
 
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // best-effort cleanup
+        }
+    }
+
     private static void TryDeleteDirectory(string path)
     {
         try
@@ -237,6 +424,49 @@ public class DownloadService
         {
             // best-effort cleanup; ignore if files are still locked
         }
+    }
+
+    /// <summary>Stream details of the selected format, as reported by yt-dlp's --print.</summary>
+    private record MediaMeta(string VideoCodec, string AudioCodec, int Width, int Height, double Fps, double Duration)
+    {
+        public static MediaMeta? Parse(string line)
+        {
+            var parts = line.Split('|');
+            if (parts.Length < 6) return null;
+            return new MediaMeta(
+                parts[0].Trim(), parts[1].Trim(),
+                (int)ParseNumber(parts[2]), (int)ParseNumber(parts[3]),
+                ParseNumber(parts[4]), ParseNumber(parts[5]));
+        }
+
+        // yt-dlp prints "NA" for anything it does not know; treat that as "unconstrained".
+        private static double ParseNumber(string value) =>
+            double.TryParse(value.Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out double parsed)
+                ? parsed
+                : 0;
+
+        // yt-dlp prints "NA" when it has no value; don't re-encode on a guess.
+        public bool HasKnownCodecs =>
+            IsKnown(VideoCodec) && IsKnown(AudioCodec);
+
+        private static bool IsKnown(string codec) =>
+            !string.IsNullOrWhiteSpace(codec) &&
+            !codec.Equals("NA", StringComparison.OrdinalIgnoreCase) &&
+            !codec.Equals("none", StringComparison.OrdinalIgnoreCase);
+
+        public bool IsXVideoCompatible =>
+            (VideoCodec.StartsWith("avc1", StringComparison.OrdinalIgnoreCase) ||
+             VideoCodec.StartsWith("h264", StringComparison.OrdinalIgnoreCase)) &&
+            (Width <= 0 || Width <= XMaxWidth) &&
+            (Height <= 0 || Height <= XMaxHeight) &&
+            (Fps <= 0 || Fps <= XMaxFps);
+
+        public bool IsXAudioCompatible =>
+            AudioCodec.StartsWith("mp4a", StringComparison.OrdinalIgnoreCase) ||
+            AudioCodec.StartsWith("aac", StringComparison.OrdinalIgnoreCase);
+
+        public override string ToString() =>
+            $"{VideoCodec}/{AudioCodec} {Width}x{Height}@{Fps.ToString(CultureInfo.InvariantCulture)}fps";
     }
 
     private class ProgressTracker
