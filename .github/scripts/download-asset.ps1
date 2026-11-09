@@ -43,7 +43,7 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
 
             if ($exitCode -eq 0) {
                 $matchedFiles = Get-ChildItem -Path $OutDir -Filter $Pattern -File -ErrorAction SilentlyContinue
-                if ($matchedFiles.Count -gt 0 -and $matchedFiles[0].Length -gt 0) {
+                if ($matchedFiles -and $matchedFiles.Count -gt 0 -and $matchedFiles[0].Length -gt 0) {
                     $sizeMB = [math]::Round($matchedFiles[0].Length / 1MB, 2)
                     Write-Host "Successfully downloaded '$($matchedFiles[0].Name)' via gh CLI ($sizeMB MB)" -ForegroundColor Green
                     $success = $true
@@ -59,22 +59,57 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         }
     }
 
-    # 2. Secondary method: curl.exe with retries and redirect following
+    # 2. Query GitHub REST API directly to resolve static release asset URL
+    # (Static asset URLs bypass GitHub frontend /releases/latest/download/ web redirects that return 504 Gateway Time-out)
+    $resolvedUrl = ""
+    if (-not $success) {
+        try {
+            $apiEndpoint = if ($Tag) {
+                "https://api.github.com/repos/$Repo/releases/tags/$Tag"
+            } else {
+                "https://api.github.com/repos/$Repo/releases/latest"
+            }
+            $headers = @{ "User-Agent" = "ytmp4-downloader" }
+            $token = if ($env:GH_TOKEN) { $env:GH_TOKEN } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { "" }
+            if ($token) {
+                $headers["Authorization"] = "Bearer $token"
+            }
+            Write-Host "Resolving asset URL via GitHub REST API: $apiEndpoint"
+            $prevEA = $ErrorActionPreference
+            $ErrorActionPreference = "Stop"
+            $rel = Invoke-RestMethod -Uri $apiEndpoint -Headers $headers -TimeoutSec 15
+            $ErrorActionPreference = $prevEA
+            if ($rel -and $rel.assets) {
+                $matchedAsset = $rel.assets | Where-Object { $_.name -like $Pattern } | Select-Object -First 1
+                if ($matchedAsset -and $matchedAsset.browser_download_url) {
+                    $resolvedUrl = $matchedAsset.browser_download_url
+                    Write-Host "Resolved static asset URL from API: $resolvedUrl ($([math]::Round($matchedAsset.size / 1MB, 2)) MB)" -ForegroundColor Cyan
+                }
+            }
+        } catch {
+            Write-Warning "Could not resolve asset via GitHub REST API: $_"
+        }
+    }
+
+    $urlToTry = if ($resolvedUrl) { $resolvedUrl } else { $FallbackUrl }
+
+    # 3. Secondary method: curl.exe with retries and redirect following
     $hasCurl = [bool](Get-Command curl.exe -ErrorAction SilentlyContinue)
-    if (-not $success -and $FallbackUrl -and $hasCurl) {
-        Write-Host "Attempting fallback via curl.exe to '$FallbackUrl'..." -ForegroundColor Yellow
+    if (-not $success -and $urlToTry -and $hasCurl) {
+        Write-Host "Attempting download via curl.exe from '$urlToTry'..." -ForegroundColor Yellow
         try {
             $curlArgs = @(
                 "-fL",
+                "-sS",
                 "--retry", "5",
                 "--retry-delay", "3",
                 "--retry-all-errors",
                 "--connect-timeout", "30",
                 "--max-time", "600",
                 "-o", $targetPath,
-                $FallbackUrl
+                $urlToTry
             )
-            Write-Host "Executing: curl.exe $($curlArgs -join ' ')"
+            Write-Host "Executing: curl.exe -fL -sS --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 --max-time 600 -o $targetPath $urlToTry"
             $prevEA = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             & curl.exe @curlArgs
@@ -94,16 +129,18 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         }
     }
 
-    # 3. Tertiary method: Invoke-WebRequest with timeout and retries
-    if (-not $success -and $FallbackUrl) {
+    # 4. Tertiary method: Invoke-WebRequest with timeout and retries
+    if (-not $success -and $urlToTry) {
         Write-Host "Attempting fallback via Invoke-WebRequest..." -ForegroundColor Yellow
         try {
             $iwrParams = @{
-                Uri = $FallbackUrl
+                Uri = $urlToTry
                 OutFile = $targetPath
                 TimeoutSec = 120
             }
-            # Add MaximumRetryCount if supported (PowerShell 7 / pwsh)
+            if ($PSVersionTable.PSVersion.Major -lt 6) {
+                $iwrParams["UseBasicParsing"] = $true
+            }
             if ($PSVersionTable.PSVersion.Major -ge 7) {
                 $iwrParams["MaximumRetryCount"] = 3
                 $iwrParams["RetryIntervalSec"] = 3
@@ -134,6 +171,5 @@ for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
 }
 
 if (-not $success) {
-    Write-Error "Failed to download '$Pattern' from '$Repo' after $MaxRetries attempts."
-    exit 1
+    throw "Failed to download '$Pattern' from '$Repo' after $MaxRetries attempts."
 }

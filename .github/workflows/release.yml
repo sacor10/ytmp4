@@ -1,7 +1,8 @@
 name: Release
 
-# Runs for three triggers:
+# Runs for four triggers:
 #   - manual trigger via workflow_dispatch (optionally specify version or auto-bump)
+#   - manual release published in GitHub Web UI (release: [published])
 #   - pushing a `vX.Y` tag directly (manual release at a chosen version)
 #   - any push to main (auto release — bumps the minor version and tags it)
 on:
@@ -11,11 +12,17 @@ on:
         description: 'Release version (e.g. 1.6). Leave blank to auto-increment from latest tag.'
         required: false
         default: ''
+  release:
+    types: [published]
   push:
     tags:
       - 'v*'
     branches:
       - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -41,6 +48,9 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             raw="${{ github.event.inputs.version }}"
             value="${raw#v}"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
+            raw="${{ github.event.release.tag_name }}"
+            value="${raw#v}"
           elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             value="${GITHUB_REF_NAME#v}"
           else
@@ -53,19 +63,23 @@ jobs:
               minor="${ver#*.}"
               value="${major}.$((minor + 1))"
             fi
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            if ! git rev-parse "v$value" >/dev/null 2>&1; then
-              git tag "v$value"
-              git push origin "v$value"
-            fi
           fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse "v$value" >/dev/null 2>&1; then
+            echo "Creating and pushing tag v$value"
+            git tag "v$value"
+            git push origin "v$value" || true
+          fi
+
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
       - name: Download yt-dlp
         shell: pwsh
         run: |
-          pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/download-asset.ps1 `
+          New-Item -ItemType Directory -Force -Path "YtMp4/tools" | Out-Null
+          & ./.github/scripts/download-asset.ps1 `
             -Repo "yt-dlp/yt-dlp" `
             -Pattern "yt-dlp.exe" `
             -OutDir "YtMp4/tools" `
@@ -74,7 +88,8 @@ jobs:
       - name: Download FFmpeg (shared build with DLLs)
         shell: pwsh
         run: |
-          pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/download-asset.ps1 `
+          New-Item -ItemType Directory -Force -Path "YtMp4/tools" | Out-Null
+          & ./.github/scripts/download-asset.ps1 `
             -Repo "BtbN/FFmpeg-Builds" `
             -Tag "latest" `
             -Pattern "ffmpeg-master-latest-win64-lgpl-shared.zip" `
@@ -82,6 +97,9 @@ jobs:
             -FallbackUrl "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
           Expand-Archive ffmpeg-master-latest-win64-lgpl-shared.zip -DestinationPath ffmpeg-tmp -Force
           $bin = Get-ChildItem ffmpeg-tmp -Recurse -Directory -Filter bin | Select-Object -First 1
+          if (-not $bin) {
+            throw "Could not locate 'bin' directory inside FFmpeg archive"
+          }
           Copy-Item "$($bin.FullName)/ffmpeg.exe" "YtMp4/tools/ffmpeg.exe" -Force
           Copy-Item "$($bin.FullName)/*.dll"      "YtMp4/tools/" -Force
           Remove-Item -Recurse -Force ffmpeg-tmp
@@ -90,7 +108,8 @@ jobs:
       - name: Download Deno (JS runtime yt-dlp needs for YouTube signature extraction)
         shell: pwsh
         run: |
-          pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/download-asset.ps1 `
+          New-Item -ItemType Directory -Force -Path "YtMp4/tools" | Out-Null
+          & ./.github/scripts/download-asset.ps1 `
             -Repo "denoland/deno" `
             -Pattern "deno-x86_64-pc-windows-msvc.zip" `
             -OutDir "." `
@@ -114,6 +133,17 @@ jobs:
             Write-Host "Verified $path ($([math]::Round($size / 1MB, 2)) MB)"
           }
 
+          $dlls = Get-ChildItem "YtMp4/tools" -Filter "*.dll"
+          if ($dlls.Count -lt 5) {
+            throw "Expected FFmpeg shared DLLs in YtMp4/tools, but found $($dlls.Count)"
+          }
+          Write-Host "Verified $($dlls.Count) FFmpeg DLLs in YtMp4/tools"
+
+          Write-Host "Testing binary execution to verify dynamic libraries..."
+          & YtMp4/tools/yt-dlp.exe --version
+          & YtMp4/tools/ffmpeg.exe -version | Select-Object -First 2
+          & YtMp4/tools/deno.exe --version
+
       - name: Publish (self-contained, single-file, win-x64)
         shell: pwsh
         run: |
@@ -129,7 +159,8 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${{ steps.ver.outputs.value }}"
-          Copy-Item -Path "YtMp4/tools" -Destination "dist/app/tools" -Recurse
+          New-Item -ItemType Directory -Force -Path "dist/app/tools" | Out-Null
+          Copy-Item -Path "YtMp4/tools/*" -Destination "dist/app/tools" -Recurse -Force
           @"
           YtMp4 v$ver - YouTube to MP4 Downloader
           ==========================================
@@ -139,11 +170,11 @@ jobs:
 
           No installation needed. Windows 10/11 x64 only.
           "@ | Out-File -FilePath "dist/app/README.txt" -Encoding utf8
-          Compress-Archive -Path "dist/app/*" -DestinationPath "dist/ytmp4.zip"
+          Compress-Archive -Path "dist/app/*" -DestinationPath "dist/ytmp4.zip" -Force
           $mb = [math]::Round((Get-Item "dist/ytmp4.zip").Length / 1MB, 0)
           Write-Host "Package: ytmp4.zip ($mb MB)"
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.value }}
