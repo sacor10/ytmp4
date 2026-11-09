@@ -1,9 +1,16 @@
 name: Release
 
-# Runs for two triggers:
+# Runs for three triggers:
+#   - manual trigger via workflow_dispatch (optionally specify version or auto-bump)
 #   - pushing a `vX.Y` tag directly (manual release at a chosen version)
 #   - any push to main (auto release — bumps the minor version and tags it)
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.6). Leave blank to auto-increment from latest tag.'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -15,6 +22,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +38,10 @@ jobs:
         id: ver
         shell: bash
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            raw="${{ github.event.inputs.version }}"
+            value="${raw#v}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             value="${GITHUB_REF_NAME#v}"
           else
             latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
@@ -43,37 +55,64 @@ jobs:
             fi
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag "v$value"
-            git push origin "v$value"
+            if ! git rev-parse "v$value" >/dev/null 2>&1; then
+              git tag "v$value"
+              git push origin "v$value"
+            fi
           fi
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
       - name: Download yt-dlp
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path YtMp4/tools | Out-Null
-          Invoke-WebRequest `
-            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
-            -OutFile "YtMp4/tools/yt-dlp.exe"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/download-asset.ps1 `
+            -Repo "yt-dlp/yt-dlp" `
+            -Pattern "yt-dlp.exe" `
+            -OutDir "YtMp4/tools" `
+            -FallbackUrl "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 
       - name: Download FFmpeg (shared build with DLLs)
         shell: pwsh
         run: |
-          Invoke-WebRequest `
-            -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip" `
-            -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-tmp
+          pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/download-asset.ps1 `
+            -Repo "BtbN/FFmpeg-Builds" `
+            -Tag "latest" `
+            -Pattern "ffmpeg-master-latest-win64-lgpl-shared.zip" `
+            -OutDir "." `
+            -FallbackUrl "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
+          Expand-Archive ffmpeg-master-latest-win64-lgpl-shared.zip -DestinationPath ffmpeg-tmp -Force
           $bin = Get-ChildItem ffmpeg-tmp -Recurse -Directory -Filter bin | Select-Object -First 1
-          Copy-Item "$($bin.FullName)/ffmpeg.exe" "YtMp4/tools/ffmpeg.exe"
-          Copy-Item "$($bin.FullName)/*.dll"      "YtMp4/tools/"
+          Copy-Item "$($bin.FullName)/ffmpeg.exe" "YtMp4/tools/ffmpeg.exe" -Force
+          Copy-Item "$($bin.FullName)/*.dll"      "YtMp4/tools/" -Force
+          Remove-Item -Recurse -Force ffmpeg-tmp
+          Remove-Item -Force ffmpeg-master-latest-win64-lgpl-shared.zip
 
       - name: Download Deno (JS runtime yt-dlp needs for YouTube signature extraction)
         shell: pwsh
         run: |
-          Invoke-WebRequest `
-            -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" `
-            -OutFile deno.zip
-          Expand-Archive deno.zip -DestinationPath YtMp4/tools -Force
+          pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/download-asset.ps1 `
+            -Repo "denoland/deno" `
+            -Pattern "deno-x86_64-pc-windows-msvc.zip" `
+            -OutDir "." `
+            -FallbackUrl "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+          Expand-Archive deno-x86_64-pc-windows-msvc.zip -DestinationPath YtMp4/tools -Force
+          Remove-Item -Force deno-x86_64-pc-windows-msvc.zip
+
+      - name: Verify tools
+        shell: pwsh
+        run: |
+          $required = @("yt-dlp.exe", "ffmpeg.exe", "deno.exe")
+          foreach ($file in $required) {
+            $path = Join-Path "YtMp4/tools" $file
+            if (-not (Test-Path $path)) {
+              throw "Missing required tool: $path"
+            }
+            $size = (Get-Item $path).Length
+            if ($size -le 0) {
+              throw "Tool file $path is empty (0 bytes)"
+            }
+            Write-Host "Verified $path ($([math]::Round($size / 1MB, 2)) MB)"
+          }
 
       - name: Publish (self-contained, single-file, win-x64)
         shell: pwsh
